@@ -1,0 +1,29 @@
+Raspberry Pi Pico 2 W – Pinout (Kurzfassung)
+
+- Stromversorgung
+  - VSYS: 1.8–5.5 V Eingang (Pins 39/40 je nach Board-Revision, üblicherweise Pin 39 VSYS)
+  - VBUS: 5 V vom USB (Pin 40)
+  - 3V3(OUT): geregelte 3.3 V (Pin 36)
+  - GND: mehrfach vorhanden (Pins 3, 8, 13, 18, 23, 28, 33, 38)
+
+- UART
+  - UART0: TX=GP0 (Pin 1), RX=GP1 (Pin 2)
+  - UART1: TX=GP8 (Pin 11), RX=GP9 (Pin 12)
+
+- I2C (Standard)
+  - I2C0: SDA=GP4 (Pin 6), SCL=GP5 (Pin 7)
+  - I2C1: SDA=GP2 (Pin 4), SCL=GP3 (Pin 5)
+
+- SPI (Standard)
+  - SPI0: SCK=GP18 (Pin 24), MOSI=GP19 (Pin 25), MISO=GP16 (Pin 21), CS=GP17 (Pin 22)
+  - SPI1: SCK=GP10 (Pin 14), MOSI=GP11 (Pin 15), MISO=GP12 (Pin 16), CS=GP13 (Pin 17)
+
+- PWM: auf allen GPIOs verfügbar
+- ADC: GP26 (ADC0, Pin 31), GP27 (ADC1, Pin 32), GP28 (ADC2, Pin 34), VSYS/3 (ADC3 intern)
+- Onboard-LED: Pico W per WLAN-Chip, steuerbar über Pin "LED" in MicroPython
+
+Hinweis für IR-Optokopf (SML):
+- RX des Pico (UART0 RX=GP1) mit TX des IR-Empfängers verbinden
+- GND gemeinsam schalten
+- Viele IR-Köpfe arbeiten mit 5 V – ggf. Pegelwandler verwenden oder 3.3 V kompatibles Interface einsetzen
+- Üblicher Port: 9600 8N1; bei invertierendem Signal in config.py UART_INVERT=True setzen
