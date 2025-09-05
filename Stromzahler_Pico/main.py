@@ -27,10 +27,14 @@ class _Config:
 	UART_RX_PIN = 1
 	UART_TX_PIN = None
 	UART_INVERT = False
-	UART_TIMEOUT_MS = 200
+	UART_TIMEOUT_MS = 1500
 	# Sonstiges
-	READ_INTERVAL_MS = 200
+	READ_INTERVAL_MS = 50
 	PUBLISH_EACH_FRAME = True
+	# Debug: kurze Diagnose, wenn keine SML-Frames erkannt werden
+	DEBUG_NO_SML = True
+	# Automatisch RX-Invertierung testen, wenn Daten kommen aber keine SML-Frames
+	AUTO_UART_INVERT = True
 
 config = _Config
 
@@ -71,18 +75,22 @@ class Buffer:
 				if start > 0:
 					self.buf = self.buf[start:]
 				break
-			# SML-Endsequenz gefolgt von optionalen 0x00-Pads (0..3) und 2 Byte CRC
+			# SML-Ende: 0x1b1b1b1b1a + 1 Byte Pad-Länge + Pad(0x00)*N + 2 Byte CRC
 			tail_idx = end + len(SML_END)
-			if len(self.buf) < tail_idx + 2:
+			# Brauchen mindestens PadLen (1) + CRC(2)
+			if len(self.buf) < tail_idx + 3:
 				break
-			pad = 0
-			while tail_idx + pad < len(self.buf) and pad < 4 and self.buf[tail_idx + pad] == 0x00:
-				pad += 1
-			if len(self.buf) < tail_idx + pad + 2:
+			pad_len = self.buf[tail_idx]
+			# Begrenzen, um wildes Pad zu vermeiden
+			if pad_len > 8:
+				pad_len = 8
+			# Prüfe, ob genug Bytes für Pad + CRC vorhanden
+			end_total = tail_idx + 1 + pad_len + 2
+			if len(self.buf) < end_total:
 				break
-			frame = bytes(self.buf[start:tail_idx + pad + 2])
+			frame = bytes(self.buf[start:end_total])
 			frames.append(frame)
-			self.buf = self.buf[tail_idx + pad + 2 : ]
+			self.buf = self.buf[end_total:]
 		return frames
 
 # Hilfsfunktionen
@@ -235,18 +243,35 @@ def mqtt_connect():
 	return client
 
 
-def setup_uart():
-	# UART0 RX auf GP1; viele IR-Köpfe liefern 5V TTL -> Pegelwandler verwenden.
+def _build_uart(inverted=None):
+	inv = getattr(config, 'UART_INVERT', False) if inverted is None else inverted
 	invert_kw = {}
 	try:
-		if getattr(config, 'UART_INVERT', False):
+		if inv:
 			invert_kw = { 'invert': UART.INV_RX }
 	except Exception:
 		invert_kw = {}
-	uart = UART(config.UART_ID, baudrate=config.UART_BAUDRATE, bits=8, parity=None, stop=1, **invert_kw)
-	if config.UART_RX_PIN is not None:
-		Pin(config.UART_RX_PIN, Pin.IN)
-	return uart
+	# RX explizit setzen, mit neutralem Eingang (Push-Pull-Kopf liefert Pegel)
+	rx_arg = {}
+	if getattr(config, 'UART_RX_PIN', None) is not None:
+		rx_arg = { 'rx': Pin(config.UART_RX_PIN, Pin.IN) }
+	return UART(
+		config.UART_ID,
+		baudrate=config.UART_BAUDRATE,
+		bits=8,
+		parity=None,
+		stop=1,
+		timeout=getattr(config, 'UART_TIMEOUT_MS', 1500),
+		timeout_char=50,
+		rxbuf=2048,
+		**rx_arg,
+		**invert_kw
+	)
+
+
+def setup_uart():
+	# UART0 RX auf GP1; viele IR-Köpfe liefern 5V TTL -> Pegelwandler verwenden.
+	return _build_uart(getattr(config, 'UART_INVERT', False))
 
 
 def publish_dict(client, topic, d):
@@ -268,6 +293,14 @@ def publish_per_obis(client, base, d):
 			client.publish(t, str(v), retain=config.MQTT_RETAIN)
 		except Exception as e:
 			print("MQTT publish obis failed:", k, e)
+
+# Leichte Status-Publish-Hilfe
+
+def publish_status(client, base, msg):
+	try:
+		client.publish(base + "/status", msg)
+	except Exception as e:
+		print("MQTT status publish failed:", e)
 
 
 # Zähler und Publisher für den Fall, dass keine SML-Daten erkannt werden
@@ -305,7 +338,10 @@ def main():
 		print("MQTT-Verbindung fehlgeschlagen:", e)
 
 	uart = setup_uart()
+	uart_inverted = getattr(config, 'UART_INVERT', False)
 	buf = Buffer()
+
+	print("Starte Hauptschleife…")
 
 	# Initialisierung des No-SML-Zählers
 	no_sml_counter = 0
@@ -313,6 +349,9 @@ def main():
 	counter_topic = config.MQTT_TOPIC_BASE + "/no_sml_counter"
 
 	last_ping = time.ticks_ms()
+	last_no_frame_diag = time.ticks_ms()
+	no_frame_since = time.ticks_ms()
+	last_heartbeat = time.ticks_ms()
 	while True:
 		try:
 			had_frames = False
@@ -322,6 +361,7 @@ def main():
 				frames = buf.extract_frames()
 				if frames:
 					had_frames = True
+					no_frame_since = time.ticks_ms()
 				for f in frames:
 					values = parse_obis_from_frame(f)
 					if mqtt:
@@ -336,6 +376,38 @@ def main():
 								print("MQTT raw publish failed:", e)
 					else:
 						print("SML:", values)
+
+			# Diagnose/Heartbeat: auch ohne UART-Daten aktiv
+			now = time.ticks_ms()
+			if getattr(config, 'DEBUG_NO_SML', False) and not had_frames and time.ticks_diff(now, last_no_frame_diag) > 3000:
+				b = buf.buf
+				s_idx = b.find(SML_START)
+				e_idx = b.find(SML_END)
+				snip = hexlify(bytes(b[-32:])).decode() if len(b) else ""
+				print("SML diag: start=", s_idx, "end=", e_idx, "buf=", len(b), "tail_hex=", snip)
+				if mqtt:
+					publish_status(mqtt, config.MQTT_TOPIC_BASE, "diag start=%d end=%d buf=%d" % (s_idx, e_idx, len(b)))
+				last_no_frame_diag = now
+
+			# Auto-UART-Invertierung nach 5s ohne Frames
+			if getattr(config, 'AUTO_UART_INVERT', True) and time.ticks_diff(now, no_frame_since) > 5000:
+				try:
+					uart = _build_uart(not uart_inverted)
+					uart_inverted = not uart_inverted
+					buf = Buffer()
+					print("UART RX invert toggled ->", uart_inverted)
+					if mqtt:
+						publish_status(mqtt, config.MQTT_TOPIC_BASE, "uart_invert=%s" % uart_inverted)
+				except Exception as e:
+					print("UART invert toggle failed:", e)
+				no_frame_since = now
+
+			# Heartbeat alle 3s
+			if time.ticks_diff(now, last_heartbeat) > 3000:
+				print("alive: inv=", uart_inverted, "buf=", len(buf.buf))
+				if mqtt:
+					publish_status(mqtt, config.MQTT_TOPIC_BASE, "alive buf=%d inv=%s" % (len(buf.buf), uart_inverted))
+				last_heartbeat = now
 
 			# Wenn keine SML-Frames erkannt wurden, Zähler tick/publish ausführen
 			if not had_frames:
