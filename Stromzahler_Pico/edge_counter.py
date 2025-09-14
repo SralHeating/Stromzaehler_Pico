@@ -21,8 +21,6 @@ class _Config:
 	MQTT_RETAIN = False
 	# GPIO zum Zählen (RX-Signal liegt auch auf GPIO1)
 	GPIO_PIN = 1
-	# Welche Flanke zählen: 'rising' | 'falling' | 'both'
-	EDGE = 'rising'
 	# Publish-Intervall in ms
 	PUBLISH_INTERVAL_MS = 1000
 	# Heartbeat-Intervall in ms
@@ -77,21 +75,15 @@ def _on_edge(_pin):
 def setup_edge_irq():
 	global _irq_ref
 	pin = Pin(config.GPIO_PIN, Pin.IN)
-	if config.EDGE == 'both':
-		trg = Pin.IRQ_RISING | Pin.IRQ_FALLING
-	elif config.EDGE == 'falling':
-		trg = Pin.IRQ_FALLING
-	else:
-		trg = Pin.IRQ_RISING
-	_irq_ref = pin.irq(trigger=trg, handler=_on_edge)
+	# Zähle ausschließlich steigende Flanken
+	_irq_ref = pin.irq(trigger=Pin.IRQ_RISING, handler=_on_edge)
 
 
 def publish_count(mqtt, topic_base):
+	# Kumulierten Zählerstand atomar lesen, aber NICHT zurücksetzen
 	state = disable_irq()
 	try:
-		global _edge_count
 		count = _edge_count
-		_edge_count = 0
 	finally:
 		enable_irq(state)
 	try:
@@ -114,7 +106,7 @@ def main():
 		print("MQTT-Verbindung fehlgeschlagen:", e)
 
 	setup_edge_irq()
-	print("Edge-IRQ aktiv auf GPIO", config.GPIO_PIN, "Flanke:", config.EDGE)
+	print("Edge-IRQ aktiv auf GPIO", config.GPIO_PIN, "Flanke: rising")
 
 	last_pub = time.ticks_ms()
 	last_hb = time.ticks_ms()

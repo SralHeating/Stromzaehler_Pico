@@ -4,6 +4,12 @@ import json
 
 import network
 from machine import UART, Pin
+# PIO Soft-UART (RP2040) für invertierbares RX
+try:
+	from rp2 import PIO, asm_pio, StateMachine as RP2StateMachine
+	_RP2_AVAILABLE = True
+except Exception:
+	_RP2_AVAILABLE = False
 
 # Integrierte Konfiguration (vormals config.py)
 class _Config:
@@ -29,12 +35,14 @@ class _Config:
 	UART_INVERT = False
 	UART_TIMEOUT_MS = 1500
 	# Sonstiges
-	READ_INTERVAL_MS = 50
+	READ_INTERVAL_MS = 20
 	PUBLISH_EACH_FRAME = True
 	# Debug: kurze Diagnose, wenn keine SML-Frames erkannt werden
 	DEBUG_NO_SML = True
 	# Automatisch RX-Invertierung testen, wenn Daten kommen aber keine SML-Frames
 	AUTO_UART_INVERT = True
+	# Soft-PIO RX verwenden (empfohlen auf RP2040, erlaubt saubere RX-Invertierung)
+	USE_PIO_RX = True
 
 config = _Config
 
@@ -93,6 +101,84 @@ class Buffer:
 			self.buf = self.buf[end_total:]
 		return frames
 
+# PIO Soft-UART RX Programme (normal und invertiert)
+if _RP2_AVAILABLE:
+	@asm_pio(in_shiftdir=PIO.SHIFT_RIGHT, autopush=True, push_thresh=8)
+	def _pio_uart_rx():
+		# Warte auf Startbit (Leitung geht auf 0, idle=1)
+		label("waitstart")
+		wait(0, pin, 0)
+		# Warte 1.5 Bit bis Mitte des ersten Datenbits
+		nop()[3]   # 0.5 Bit (bei freq=8*baud)
+		nop()[7]   # +1 Bit
+		set(x, 7) # 8 Datenbits
+		label("bitloop")
+		# 1 (Instr) + 6 (Delay) + 1 (jmp) = 8 Zyklen/Bit
+		in_(pins, 1)[6]
+		jmp(x_dec, "bitloop")
+		# Stopbit ignorieren (1 Bit warten)
+		nop()[7]
+		jmp("waitstart")
+
+	@asm_pio(in_shiftdir=PIO.SHIFT_RIGHT, autopush=True, push_thresh=8)
+	def _pio_uart_rx_inv():
+		# Invertierte Leitung: idle=0, Startbit ist 1
+		label("waitstart")
+		wait(1, pin, 0)
+		# Warte 1.5 Bit bis Mitte des ersten Datenbits
+		nop()[3]
+		nop()[7]
+		set(x, 7)
+		label("bitloop")
+		# 1 (Instr) + 6 (Delay) + 1 (jmp) = 8 Zyklen/Bit
+		in_(pins, 1)[6]
+		jmp(x_dec, "bitloop")
+		nop()[7]
+		jmp("waitstart")
+
+	class PioUartRx:
+		def __init__(self, rx_pin: int, baudrate: int, inverted: bool = False, sm_id: int = 0):
+			self.rx_pin_num = rx_pin
+			self.baudrate = int(baudrate)
+			self.inverted = bool(inverted)
+			self.sm_id = sm_id
+			self._sm = None
+			self._start()
+
+		def _start(self):
+			if self._sm:
+				try:
+					self._sm.active(0)
+				except Exception:
+					pass
+			pin = Pin(self.rx_pin_num, Pin.IN)  # kein Pull-Up, Lesekopf ist Push-Pull
+			prog = _pio_uart_rx_inv if self.inverted else _pio_uart_rx
+			self._sm = RP2StateMachine(self.sm_id, prog, freq=self.baudrate * 8, in_base=pin, jmp_pin=pin)
+			self._sm.active(1)
+
+		def set_inverted(self, inv: bool):
+			if bool(inv) != self.inverted:
+				self.inverted = bool(inv)
+				self._start()
+
+		def read(self):
+			# Liefert None wenn nichts da ist, sonst bytes
+			sm = self._sm
+			try:
+				n = sm.rx_fifo()
+			except Exception:
+				n = 0
+			if not n:
+				return None
+			out = bytearray()
+			for _ in range(n):
+				v = sm.get() & 0xFF
+				# Bei invertiertem Signal sind die Datenbits invertiert -> rückgängig machen
+				if self.inverted:
+					v ^= 0xFF
+				out.append(v)
+			return bytes(out)
+
 # Hilfsfunktionen
 
 def decode_obis_str(b):
@@ -131,7 +217,8 @@ def parse_obis_from_frame(frame: bytes):
 		if pos >= len(data):
 			return None, pos
 		t = data[pos]
-		if (t & 0x70) == 0x50:  # integer/unsigned
+		# Integers: signed (0x5x) und unsigned (0x6x)
+		if (t & 0xF0) in (0x50, 0x60):
 			ln = t & 0x0F
 			if ln == 0 or pos + 1 + ln > len(data):
 				return None, pos
@@ -139,8 +226,8 @@ def parse_obis_from_frame(frame: bytes):
 			v = 0
 			for b in valb:
 				v = (v << 8) | (b & 0xFF)
-			# signed Korrektur
-			if (t & 0x08) and ln > 0 and (valb[0] & 0x80):
+			# signed Korrektur bei 0x5x
+			if (t & 0xF0) == 0x50 and ln > 0 and (valb[0] & 0x80):
 				v = v - (1 << (8*ln))
 			return v, pos + 1 + ln
 		return None, pos
@@ -155,9 +242,9 @@ def parse_obis_from_frame(frame: bytes):
 			# nur erste Vorkommen verarbeiten
 			if key and i not in visited:
 				visited.add(i)
-				# Suche Value + Scaler + Unit in den nächsten ~48 Bytes
+				# Suche Value + Scaler + Unit in den nächsten ~64 Bytes
 				p = i + 6
-				endp = min(len(data), p + 48)
+				endp = min(len(data), p + 64)
 				scaler = 0
 				unit = None
 				value = None
@@ -175,12 +262,12 @@ def parse_obis_from_frame(frame: bytes):
 						unit = UNIT_MAP.get(data[p+1], data[p+1])
 						p += 2
 						continue
-					# Integer-Wert
+					# Integer-Wert (signed/unsigned)
 					v, np = read_int_at(p)
 					if v is not None:
 						value = v
 						p = np
-						# nicht break; ggf. folgt scaler danach, also weiterlaufen
+						continue
 					p += 1
 				if value is not None:
 					if scaler:
@@ -257,8 +344,7 @@ def _build_uart(inverted=None):
 		rx_arg = { 'rx': Pin(config.UART_RX_PIN, Pin.IN) }
 	return UART(
 		config.UART_ID,
-		baudrate=config.UART_BAUDRATE,
-		bits=8,
+		
 		parity=None,
 		stop=1,
 		timeout=getattr(config, 'UART_TIMEOUT_MS', 1500),
@@ -270,6 +356,15 @@ def _build_uart(inverted=None):
 
 
 def setup_uart():
+	# PIO-Soft-RX bevorzugen, wenn verfügbar/aktiviert, sonst Hardware-UART
+	use_pio = getattr(config, 'USE_PIO_RX', False) and _RP2_AVAILABLE
+	if use_pio:
+		try:
+			uart = PioUartRx(config.UART_RX_PIN, config.UART_BAUDRATE, inverted=getattr(config, 'UART_INVERT', False), sm_id=0)
+			print("PIO Soft-UART RX aktiv (invert=", getattr(config, 'UART_INVERT', False), ")")
+			return uart
+		except Exception as e:
+			print("PIO RX init failed:", e, "-> fallback auf HW-UART")
 	# UART0 RX auf GP1; viele IR-Köpfe liefern 5V TTL -> Pegelwandler verwenden.
 	return _build_uart(getattr(config, 'UART_INVERT', False))
 
@@ -355,27 +450,34 @@ def main():
 	while True:
 		try:
 			had_frames = False
-			data = uart.read()
-			if data:
+			# Drain UART/PIO mehrfach pro Loop, um FIFO-Überläufe zu vermeiden
+			for _ in range(32):
+				data = uart.read()
+				if not data:
+					break
+				if getattr(config, 'DEBUG_NO_SML', False):
+					try:
+						print("rx:", hexlify(data[:24]).decode())
+					except Exception:
+						pass
 				buf.append(data)
 				frames = buf.extract_frames()
 				if frames:
 					had_frames = True
 					no_frame_since = time.ticks_ms()
-				for f in frames:
-					values = parse_obis_from_frame(f)
-					if mqtt:
-						if config.PUBLISH_EACH_FRAME:
-							publish_dict(mqtt, config.MQTT_PUBLISH_JSON_TOPIC, values)
-							publish_per_obis(mqtt, config.MQTT_TOPIC_BASE, values)
-						# Rohdaten optional
-						if "_raw_hex" in values:
-							try:
-								mqtt.publish(config.MQTT_PUBLISH_RAW_TOPIC, values["_raw_hex"], retain=False)
-							except Exception as e:
-								print("MQTT raw publish failed:", e)
-					else:
-						print("SML:", values)
+					for f in frames:
+						values = parse_obis_from_frame(f)
+						if mqtt:
+							if config.PUBLISH_EACH_FRAME:
+								publish_dict(mqtt, config.MQTT_PUBLISH_JSON_TOPIC, values)
+								publish_per_obis(mqtt, config.MQTT_TOPIC_BASE, values)
+							if "_raw_hex" in values:
+								try:
+									mqtt.publish(config.MQTT_PUBLISH_RAW_TOPIC, values["_raw_hex"], retain=False)
+								except Exception as e:
+									print("MQTT raw publish failed:", e)
+						else:
+							print("SML:", values)
 
 			# Diagnose/Heartbeat: auch ohne UART-Daten aktiv
 			now = time.ticks_ms()
@@ -392,12 +494,21 @@ def main():
 			# Auto-UART-Invertierung nach 5s ohne Frames
 			if getattr(config, 'AUTO_UART_INVERT', True) and time.ticks_diff(now, no_frame_since) > 5000:
 				try:
-					uart = _build_uart(not uart_inverted)
-					uart_inverted = not uart_inverted
-					buf = Buffer()
-					print("UART RX invert toggled ->", uart_inverted)
-					if mqtt:
-						publish_status(mqtt, config.MQTT_TOPIC_BASE, "uart_invert=%s" % uart_inverted)
+					# PIO-Soft-UART bevorzugt umschalten, sonst HW-UART neu aufbauen
+					if _RP2_AVAILABLE and isinstance(uart, PioUartRx):
+						uart_inverted = not uart_inverted
+						uart.set_inverted(uart_inverted)
+						buf = Buffer()
+						print("PIO RX invert toggled ->", uart_inverted)
+						if mqtt:
+							publish_status(mqtt, config.MQTT_TOPIC_BASE, "uart_invert=%s" % uart_inverted)
+					else:
+						uart = _build_uart(not uart_inverted)
+						uart_inverted = not uart_inverted
+						buf = Buffer()
+						print("HW UART RX invert toggled ->", uart_inverted)
+						if mqtt:
+							publish_status(mqtt, config.MQTT_TOPIC_BASE, "uart_invert=%s" % uart_inverted)
 				except Exception as e:
 					print("UART invert toggle failed:", e)
 				no_frame_since = now
